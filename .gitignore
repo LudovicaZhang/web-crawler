@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.ms_cache/
+M&S_temp/
+logs/
+.idea/
