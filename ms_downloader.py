@@ -1,4 +1,14 @@
 from __future__ import annotations
+"""
+M&S 男装图片抓取与拼图脚本。
+
+流程概览：
+1. 从配置分类页抓取商品 URL（去重）。
+2. 进入商品页提取款号/颜色/价格/成分及图片 URL。
+3. 下载图片并拼图，底部追加文本信息。
+4. 先落本地，再传共享盘；共享盘校验成功后删除本地。
+5. 使用进度文件实现断点续跑和去重。
+"""
 
 import json
 import re
@@ -12,6 +22,7 @@ import urllib.request
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import TextIO
 
 
 BASE_HEADERS = {
@@ -23,6 +34,7 @@ BASE_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
+# 分类入口：key 同时用于输出目录名和分类进度文件名。
 CATEGORIES = {
     "chinos": "https://www.marksandspencer.com/l/men/mens-trousers/fs5/chinos",
     "holiday_shop": "https://www.marksandspencer.com/l/men/mens-holiday-shop",
@@ -61,6 +73,7 @@ class ProductMetadata:
     product_code: str
 
 
+# 图像拼接与文本排版参数。
 INFO_FONT_SIZE = 280
 INFO_MIN_FONT_SIZE = 56
 INFO_LINE_GAP = 60
@@ -78,16 +91,22 @@ BACKOFF_BASE_SECONDS = 2.0
 HTML_CACHE_TTL_SECONDS = 24 * 60 * 60
 LOCAL_OUTPUT_ROOT = Path(r"C:\Users\Administrator\Desktop\M&S")
 SHARED_OUTPUT_ROOT = Path(r"\\192.168.1.18\跨部门共享\设计图片下载\官网下图\男装\M&S")
+# 每次运行前清理旧 .log，并统一写入该日志文件。
+LOG_ROOT = Path.cwd() / "logs"
+LOG_FILE_NAME = "ms_downloader.log"
 
 
 @dataclass
 class RunContext:
+    """运行时上下文：统一传递请求器、缓存目录和分类进度目录。"""
     request_manager: "RequestManager"
     cache_root: Path
     progress_root: Path
 
 
 class RequestManager:
+    """带限速、重试和可选缓存的 HTTP 请求封装。"""
+
     def __init__(self, delay_seconds: float = REQUEST_DELAY_SECONDS):
         self.delay_seconds = delay_seconds
         self._last_request_at = 0.0
@@ -143,6 +162,33 @@ class RequestManager:
         time.sleep(max(self.delay_seconds, BACKOFF_BASE_SECONDS ** (attempt - 1)))
 
 
+class TeeTextIO:
+    """把同一份日志同时写入多个输出流（控制台 + 文件）。"""
+
+    def __init__(self, *streams: TextIO):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def prepare_run_log(log_root: Path, log_file_name: str) -> Path:
+    """清理旧日志并返回本次运行日志文件路径。"""
+    log_root.mkdir(parents=True, exist_ok=True)
+    for old_log in log_root.glob("*.log"):
+        try:
+            old_log.unlink()
+        except OSError:
+            pass
+    return log_root / log_file_name
+
+
 def is_retryable_http_error(status_code: int) -> bool:
     return status_code in {408, 425, 429, 500, 502, 503, 504}
 
@@ -166,6 +212,7 @@ def url_temp_path(temp_root: Path, url: str, suffix: str) -> Path:
 
 
 def load_progress(progress_path: Path) -> dict:
+    """读取进度 JSON，损坏或不存在时返回空结构。"""
     if not progress_path.exists():
         return {"completed": []}
     try:
@@ -231,6 +278,7 @@ def extract_product_urls(html: str, current_url: str) -> list[str]:
 
 
 def normalize_product_url(url: str) -> str:
+    """商品 URL 归一化：仅保留 color 参数，用于去重。"""
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     kept_query = [(key, value) for key, value in query if key == "color"]
@@ -284,6 +332,7 @@ def format_colour(value: str) -> str:
 
 
 def extract_product_metadata(html: str, product_url: str) -> ProductMetadata:
+    """从 PDP 页面提取拼图所需的文本信息。"""
     product_details = extract_product_details(html)
     attributes = product_details.get("attributes", {})
     selected_variant = find_selected_variant(product_details, product_url)
@@ -304,6 +353,7 @@ def extract_product_metadata(html: str, product_url: str) -> ProductMetadata:
 
 
 def extract_large_image_urls(html: str) -> list[str]:
+    """从 JSON-LD 中提取并升级为大图 URL。"""
     for match in JSON_LD_PATTERN.finditer(html):
         raw_payload = match.group(1).strip()
         try:
@@ -351,6 +401,7 @@ def safe_extension(image_url: str, content_type: str | None) -> str:
 
 
 def download_image(image_url: str, temp_root: Path, request_manager: RequestManager) -> Path:
+    """下载单张原图到临时目录；已缓存则直接复用。"""
     guessed_extension = safe_extension(image_url, None)
     temp_path = url_temp_path(temp_root, image_url, guessed_extension)
     if temp_path.exists():
@@ -363,6 +414,7 @@ def download_image(image_url: str, temp_root: Path, request_manager: RequestMana
 
 
 def copy_file_if_needed(source_path: Path, destination_path: Path) -> None:
+    """复制文件到目标路径，支持重试；同大小文件直接跳过。"""
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     if destination_path.exists():
         source_size = source_path.stat().st_size
@@ -384,6 +436,7 @@ def copy_file_if_needed(source_path: Path, destination_path: Path) -> None:
 
 
 def sync_local_outputs_to_shared(local_root: Path, shared_root: Path) -> int:
+    """程序启动时先补同步历史本地文件到共享盘。"""
     moved_count = 0
     if not local_root.exists():
         return moved_count
@@ -411,6 +464,7 @@ def sync_local_outputs_to_shared(local_root: Path, shared_root: Path) -> int:
 
 
 def transfer_local_file_to_shared(local_file: Path, shared_file: Path) -> bool:
+    """传输并校验后删除本地文件，返回是否完成清理。"""
     if not local_file.exists():
         return False
 
@@ -487,6 +541,12 @@ def measure_text_bbox(draw, text: str, font):
 
 
 def save_stitched_image(image, output_path: Path) -> None:
+    """
+    在 20MB~30MB 目标范围内保存输出图：
+    - 先尝试 1.0 原始尺寸
+    - 超过上限则在 [MIN_OUTPUT_SCALE, 1.0] 二分搜索
+    - 尽量逼近 TARGET_OUTPUT_FILE_BYTES
+    """
     suffix = output_path.suffix.lower()
     tried_scales: dict[float, int] = {}
 
@@ -570,6 +630,10 @@ def save_stitched_image(image, output_path: Path) -> None:
 
 
 def choose_render_scale(total_width: int, image_height: int, info_lines: list[str]) -> float:
+    """
+    估算绘制缩放比，确保最终画布像素量不超过上限，
+    防止超大图拼接导致内存过高或 Pillow 报错。
+    """
     from PIL import Image, ImageDraw  # type: ignore
 
     probe = Image.new("RGB", (10, 10), color="white")
@@ -678,6 +742,7 @@ def prepare_image_for_canvas(source_path: Path, scale: float):
 
 
 def stitch_images(image_paths: list[Path], output_path: Path, metadata: ProductMetadata) -> None:
+    """优先使用 Pillow 拼图；缺失 Pillow 时回退到 PowerShell 方案。"""
     try:
         from PIL import Image, ImageDraw  # type: ignore
     except ImportError:
@@ -832,6 +897,12 @@ def process_product(
     temp_root: Path,
     context: RunContext,
 ) -> bool:
+    """
+    处理单个商品：
+    - 抓取 PDP 并提取元信息、图片链接
+    - 先生成本地图，再传共享盘
+    - 共享盘校验成功后删除本地文件
+    """
     product_cache_path = url_cache_path(context.cache_root, "html", product_url, ".html")
     html = context.request_manager.fetch_text(
         product_url,
@@ -844,6 +915,7 @@ def process_product(
     local_output_path = local_category_dir / f"{product_code}.png"
     shared_output_path = shared_category_dir / f"{product_code}.png"
 
+    # 共享盘已存在同款则直接跳过，必要时顺便清理本地残留。
     if shared_output_path.exists():
         if local_output_path.exists():
             try:
@@ -853,6 +925,7 @@ def process_product(
         print(f"  skip {product_code} (already exists in shared)")
         return False
 
+    # 共享盘不存在但本地存在，先尝试补同步，避免重复拼图。
     if local_output_path.exists():
         try:
             if transfer_local_file_to_shared(local_output_path, shared_output_path):
@@ -871,6 +944,7 @@ def process_product(
 
     downloaded_paths: list[Path] = []
     try:
+        # 逐张下载原图（带临时缓存），每次写入下载进度，降低中断损失。
         for image_url in image_urls:
             cached_image_path = download_image(
                 image_url,
@@ -883,6 +957,7 @@ def process_product(
 
         local_category_dir.mkdir(parents=True, exist_ok=True)
         shared_category_dir.mkdir(parents=True, exist_ok=True)
+        # 拼图先落本地，再传共享盘。
         stitch_images(downloaded_paths, local_output_path, metadata)
         print(f"  saved local {local_output_path.name} with {len(downloaded_paths)} images")
         try:
@@ -907,6 +982,12 @@ def collect_category(
     temp_root: Path,
     context: RunContext,
 ) -> None:
+    """
+    遍历单个分类：
+    - 翻页收集商品链接
+    - 结合进度文件跳过已完成商品
+    - 调用 process_product 处理剩余商品
+    """
     local_category_dir = local_output_root / category_name
     shared_category_dir = shared_output_root / category_name
     local_category_dir.mkdir(parents=True, exist_ok=True)
@@ -920,6 +1001,7 @@ def collect_category(
     product_urls: list[str] = []
     seen_urls: set[str] = set()
 
+    # 先把这个分类的链接池收集完整，避免边抓边翻页导致统计混乱。
     while current_url:
         print(f"[{category_name}] page {current_page}: {current_url}")
         listing_cache_path = url_cache_path(context.cache_root, "html", current_url, ".html")
@@ -948,6 +1030,7 @@ def collect_category(
     saved_count = 0
     for index, product_url in enumerate(product_urls, start=1):
         normalized = normalize_product_url(product_url)
+        # URL 已完成则跳过；该记录用于断点续跑。
         if normalized in completed_urls:
             print(f"[{category_name}] product {index}/{len(product_urls)} skip completed")
             continue
@@ -977,6 +1060,13 @@ def collect_category(
 
 
 def main() -> int:
+    """程序入口：初始化日志、目录、上下文，并按分类顺序执行抓取。"""
+    log_path = prepare_run_log(LOG_ROOT, LOG_FILE_NAME)
+    log_file = log_path.open("w", encoding="utf-8", buffering=1)
+    sys.stdout = TeeTextIO(sys.__stdout__, log_file)
+    sys.stderr = TeeTextIO(sys.__stderr__, log_file)
+    print(f"Logging to: {log_path}")
+
     local_output_root = LOCAL_OUTPUT_ROOT
     shared_output_root = SHARED_OUTPUT_ROOT
     temp_root = Path.cwd() / "M&S_temp"
